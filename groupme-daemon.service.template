@@ -1,0 +1,21 @@
+[Unit]
+Description=GroupMe Ingest Daemon (SQLite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/groupme.env
+WorkingDirectory=/opt/groupme
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/groupme/venv/bin/python -u /opt/groupme/groupme_ingest.py --daemon --interval 30 --head-pages 6 --reconcile-head 6 --verbose
+Restart=always
+RestartSec=5
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

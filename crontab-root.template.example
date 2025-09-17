@@ -1,0 +1,6 @@
+# Example crontab entry for automated snapshots
+# Run every 30 minutes
+*/30 * * * * /opt/groupme/snapshot.sh >>/var/log/groupme_snapshot.log 2>&1
+
+# Alternative: Run every hour
+# 0 * * * * /opt/groupme/snapshot.sh >>/var/log/groupme_snapshot.log 2>&1
