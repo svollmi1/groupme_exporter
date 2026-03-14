@@ -222,7 +222,7 @@ def backfill(conn: sqlite3.Connection, verbose: bool = False, test_pages: Option
         oldest = min(batch, key=lambda m: int(m["id"]))["id"]
 
         # progress detection
-        if oldest == before_id or before_id == prev_before_id or inserted_now == 0:
+        if oldest == before_id or before_id == prev_before_id:
             stagnant_pages += 1
         else:
             stagnant_pages = 0
