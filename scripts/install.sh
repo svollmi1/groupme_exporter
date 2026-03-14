@@ -19,7 +19,7 @@ if [[ ! -f "$ENV_FILE" ]]; then
 fi
 
 # Extract GROUPME_INSTALL_DIR, defaulting to /opt/groupme if not set
-GROUPME_INSTALL_DIR=$(grep -E '^GROUPME_INSTALL_DIR=' "$ENV_FILE" | cut -d= -f2- | tr -d '"' || true)
+GROUPME_INSTALL_DIR=$(grep -E '^GROUPME_INSTALL_DIR=' "$ENV_FILE" | head -1 | cut -d= -f2- | tr -d '"\r\n' || true)
 GROUPME_INSTALL_DIR="${GROUPME_INSTALL_DIR:-/opt/groupme}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
