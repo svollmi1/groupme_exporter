@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/groupme.env
-WorkingDirectory=/opt/groupme
+WorkingDirectory=%%INSTALL_DIR%%
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/groupme/venv/bin/python -u /opt/groupme/groupme_ingest.py --daemon --interval 30 --head-pages 6 --reconcile-head 6 --verbose
+ExecStart=%%INSTALL_DIR%%/venv/bin/python -u %%INSTALL_DIR%%/groupme_ingest.py --daemon --interval 30 --head-pages 6 --reconcile-head 6 --verbose
 Restart=always
 RestartSec=5
 # Security hardening
