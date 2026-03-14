@@ -169,8 +169,8 @@ sudo journalctl -u groupme-daemon -f
 tail -f /var/log/groupme_snapshot.log
 
 # Message count and ingestion progress
-python $GROUPME_INSTALL_DIR/progress.py
+$GROUPME_INSTALL_DIR/venv/bin/python $GROUPME_INSTALL_DIR/progress.py
 
 # Completeness check against GroupMe API
-python $GROUPME_INSTALL_DIR/verify_coverage.py
+$GROUPME_INSTALL_DIR/venv/bin/python $GROUPME_INSTALL_DIR/verify_coverage.py
 ```

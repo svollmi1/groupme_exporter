@@ -118,16 +118,16 @@ sudo bash scripts/install.sh
 
 ```bash
 # One-time historical sync
-python groupme_ingest.py
+venv/bin/python groupme_ingest.py
 
 # Test mode (3 pages only)
-python groupme_ingest.py --test
+venv/bin/python groupme_ingest.py --test
 
 # Head-sweep only (no backfill)
-python groupme_ingest.py --topoff-only
+venv/bin/python groupme_ingest.py --topoff-only
 
 # Run as daemon manually
-python groupme_ingest.py --daemon --interval 30 --head-pages 6 --reconcile-head 6 --verbose
+venv/bin/python groupme_ingest.py --daemon --interval 30 --head-pages 6 --reconcile-head 6 --verbose
 ```
 
 Full CLI options:
@@ -156,10 +156,10 @@ sudo journalctl -u groupme-daemon -f
 tail -f /var/log/groupme_snapshot.log
 
 # Message count and ingestion progress
-python progress.py
+venv/bin/python progress.py
 
 # Completeness check against GroupMe API
-python verify_coverage.py
+venv/bin/python verify_coverage.py
 ```
 
 ---
