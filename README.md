@@ -63,7 +63,7 @@ groupme-exporter/
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/svollmin1/groupme_exporter.git
+git clone https://github.com/vollminlab/groupme_exporter.git
 cd groupme_exporter
 ```
 
