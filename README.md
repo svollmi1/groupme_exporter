@@ -77,11 +77,19 @@ Every API call goes through `api_get`, which layers two retry mechanisms:
 The loop backs off on rate-limit and 5xx responses, on SSL/connection/read timeouts, and on
 responses that are empty or not `application/json`. Request timeouts are 10s connect, 60s read.
 
-**The non-obvious part:** after exhausting all retries, `api_get` returns `{"messages": []}` — an
-empty page. Backfill and top-off both treat an empty page as *end of history*, so a sustained API
-outage looks identical to "there is nothing left to fetch". The daemon logs a cycle that added 0
-rows and sleeps; it never raises, so systemd `Restart=always` never fires. Use
-`src/verify_coverage.py` to detect this, not the exit status.
+**Failure is never silent.** Once the retries are spent, `api_get` raises `GroupMeUnavailable`
+carrying the last failure reason. It deliberately does not return an empty page, because backfill
+and top-off both read an empty page as *end of history* — returning one on failure would make a
+sustained outage indistinguishable from being fully caught up.
+
+A one-shot run therefore exits non-zero. The daemon catches the exception per cycle, logs
+`⚠️ cycle failed, retrying next interval`, and keeps its cadence rather than exiting — systemd would
+otherwise restart it into a full startup sync every `RestartSec` for the duration of the outage. The
+next cycle re-reads the same head pages, so nothing is skipped.
+
+**HTTP 304** is GroupMe's "no messages in this range" and is returned as an empty page on the first
+call, so the ordinary end of a backfill costs one request rather than six attempts and ~61s of
+backoff.
 
 ### Backfill is not re-run from scratch
 
@@ -105,11 +113,12 @@ on every run.
 | `group_members` | `group_id`, `user_id`, `role` | PK `group_id, user_id` |
 | `messages` | `id`, `group_id`, `created_at`, `user_id`, `name`, `text`, `source_guid`, `system` | PK `id` |
 | `likes` | `message_id`, `user_id` | PK `message_id, user_id` |
-| `reactions` | `message_id`, `type`, `code`, `user_id` | PK `message_id, code, user_id` |
-| `attachments` | `id`, `message_id`, `type`, `url`, `lat`, `lon`, `name`, `data` | PK `id` — autoincrement |
+| `reactions` | `message_id`, `type`, `code`, `user_id` | PK `message_id, code, user_id` + `idx_reactions_unique` |
+| `attachments` | `id`, `message_id`, `type`, `url`, `lat`, `lon`, `name`, `data` | PK `id` autoincrement + `idx_attachments_unique` |
 | `ingestion_progress` | `group_id`, `before_id`, `ingested_count` | PK `group_id` |
 
-One index: `idx_messages_group_ts` on `messages(group_id, created_at)`.
+Indexes: `idx_messages_group_ts` on `messages(group_id, created_at)`, plus the two uniqueness
+indexes described under [Idempotency](#idempotency).
 
 `created_at` is the raw GroupMe value — Unix epoch seconds, stored as INTEGER. `attachments.data`
 holds the full attachment JSON object verbatim, so nothing the API returns is lost even where there
@@ -118,19 +127,22 @@ join or a group rename.
 
 ### Idempotency
 
-Deduplication is entirely `INSERT OR IGNORE` against the primary keys above. `messages.id` is the
-dedup key that matters — a message re-read on every one of the six head pages, every 30 seconds,
-inserts once and is ignored thereafter.
+Deduplication is entirely `INSERT OR IGNORE`. `messages.id` is the dedup key that matters — a
+message re-read on every one of the six head pages, every 30 seconds, inserts once and is ignored
+thereafter.
 
-Two tables do not have that property, which matters if you query them:
+Two tables needed help to get that property, because their declared keys did not provide it:
 
-- **`attachments` has no unique constraint.** Its primary key is an autoincrement surrogate, so
-  `INSERT OR IGNORE` has nothing to conflict on and each head sweep re-inserts rows for the messages
-  it re-reads. Deduplicate on `(message_id, type, url)` when reading, or add a unique index.
-- **`reactions` keys on `code`, which may be NULL.** SQLite permits NULLs in a non-INTEGER primary
-  key, and NULLs never compare equal, so reaction rows with no `code` are not deduplicated either.
-  `type` is deliberately not part of the key. Plain likes are unaffected — they land in `likes`,
-  which is keyed correctly.
+| Index | Covers | Why the primary key was not enough |
+|---|---|---|
+| `idx_attachments_unique` | `message_id, type, COALESCE(url,''), COALESCE(name,''), COALESCE(data,'')` | `attachments` has only an autoincrement surrogate key, so `INSERT OR IGNORE` had nothing to conflict on |
+| `idx_reactions_unique` | `message_id, COALESCE(code,''), user_id` | SQLite permits NULLs in a non-INTEGER primary key and NULLs never compare equal, so rows with no `code` duplicated |
+
+Both are created by `_ensure_dedup_indexes()` on startup, after a one-time collapse of the rows that
+accumulated before they existed. The collapse is the expensive part, so it is skipped once the index
+is present. Plain likes were never affected — they land in `likes`, which is keyed correctly.
+
+`type` is deliberately not part of the reactions key.
 
 `src/progress.py` already applies the normalization the analysis queries need: it folds a blank or
 NULL `code` to `❤️` and unions `likes` with heart `reactions`, since GroupMe reports the same user
@@ -349,17 +361,15 @@ a plain `cp` of `groupme.sqlite` while the daemon is writing would not be safe.
 Output goes to stdout — captured by the cron redirect into `/var/log/groupme_snapshot.log` — and
 also to syslog under the tag `groupme-snapshot`.
 
-Two things to know about the tail end of that run:
+The prune glob is anchored on a digit (`groupme_[0-9]*.sqlite`) so it matches only the timestamped
+files. `groupme_latest.sqlite` is rewritten every run and would otherwise always be the newest
+match, silently costing one snapshot of retention. Note it is a copy rather than a symlink, so the
+destination holds a second full copy of the newest database on top of the three kept snapshots.
 
-- **`groupme_latest.sqlite` counts against retention.** The prune globs `groupme_*.sqlite`, which
-  matches the stable copy as well as the timestamped ones, so what actually survives is roughly two
-  timestamped snapshots plus `groupme_latest.sqlite` — not three timestamped snapshots. It is a
-  copy, not a symlink, so the destination holds two full copies of the newest database.
-- **The script currently exits 2 after finishing.** A stray heredoc terminator on its last line
-  makes bash report `unexpected EOF while looking for matching` once it reaches the end of the
-  file. Every command above it has already run and the snapshot is complete and correct, but cron
-  sees a non-zero exit. Do not read that as a failed backup — check the log's `Snapshot complete`
-  line instead.
+A non-zero exit from this script means a real failure. That was not always true — until
+[#3](https://github.com/vollminlab/groupme-exporter/pull/3) a stray heredoc terminator on the last
+line made every successful run exit 2, so if you have historical cron failure mail for this job,
+that is where it came from.
 
 ---
 
