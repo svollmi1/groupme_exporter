@@ -73,8 +73,12 @@ rm -f "$LOCAL_TMP"
 
 log "Snapshot complete: $(basename "$SMB_OUT") ($(du -h "$SMB_OUT" | awk "{print \$1}"))"
 
-# Retention: keep newest $KEEP
-TO_DELETE=$(ls -1t "$DEST"/${PREFIX}_*.sqlite 2>/dev/null | tail -n +$((KEEP+1)) || true)
+# Retention: keep newest $KEEP timestamped snapshots.
+# The glob is anchored on a digit so it matches ${PREFIX}_<timestamp>.sqlite and
+# never groupme_latest.sqlite — that copy is rewritten every run, so a plain
+# ${PREFIX}_*.sqlite glob made it the newest entry and silently cost us one
+# real snapshot of retention.
+TO_DELETE=$(ls -1t "$DEST"/${PREFIX}_[0-9]*.sqlite 2>/dev/null | tail -n +$((KEEP+1)) || true)
 if [[ -n "$TO_DELETE" ]]; then
   log "Pruning old snapshots:"
   while IFS= read -r f; do
@@ -86,4 +90,3 @@ else
 fi
 
 log "Done"
-SH'
