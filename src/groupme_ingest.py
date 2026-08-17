@@ -48,46 +48,104 @@ def make_session() -> requests.Session:
 
 SESSION = make_session()
 
+class GroupMeUnavailable(RuntimeError):
+    """The GroupMe API could not be reached, or answered unusably, after MAX_RETRIES."""
+
+
 def api_get(path: str, params: Dict[str, Any]) -> Any:
     """
     GET with retry/backoff for:
       - HTTP 420/429/5xx (adapter Retry + loop)
       - SSL/connection/timeouts
-      - Unexpected non-JSON/empty bodies (treat as empty page after retries)
+      - Unexpected non-JSON/empty bodies
+
+    Returns the decoded "response" object. HTTP 304 is GroupMe's way of saying
+    "no messages in this range" and is returned as an empty page immediately.
+
+    Raises GroupMeUnavailable once the retries are spent. It must never return
+    an empty page to signal failure: callers treat an empty page as the end of
+    history, so doing that made a sustained outage indistinguishable from being
+    fully caught up — the daemon would log a clean cycle and never retry the
+    gap.
     """
     params = dict(params or {})
     params["token"] = TOKEN
 
     backoff = 1.0
+    last_reason = "no attempt completed"
     for _ in range(MAX_RETRIES):
         try:
             r = SESSION.get(f"{BASE}{path}", params=params, timeout=(10, 60))  # (connect, read)
+            # 304 Not Modified: a definitive "nothing here", not a failure.
+            if r.status_code == 304:
+                return {"messages": []}
             if r.status_code in (420, 429) or r.status_code >= 500:
+                last_reason = f"HTTP {r.status_code}"
                 time.sleep(backoff); backoff = min(backoff * 2, 30); continue
             ct = (r.headers.get("Content-Type") or "").lower()
             if not r.content or ("application/json" not in ct):
+                last_reason = f"HTTP {r.status_code} with {ct or 'no content-type'} and {len(r.content)} bytes"
                 time.sleep(backoff); backoff = min(backoff * 2, 30); continue
             return r.json().get("response", {})
         except (requests.exceptions.SSLError,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.ReadTimeout,
                 requests.exceptions.Timeout,
-                ValueError):
+                ValueError) as e:
+            last_reason = f"{type(e).__name__}: {e}"
             time.sleep(backoff); backoff = min(backoff * 2, 30); continue
 
-    # Final attempt: if still non-JSON/empty, treat as "no more messages"
-    r = SESSION.get(f"{BASE}{path}", params=params, timeout=(10, 60))
-    if not r.content:
-        return {"messages": []}
-    try:
-        return r.json().get("response", {})
-    except Exception:
-        return {"messages": []}
+    raise GroupMeUnavailable(
+        f"GET {path} failed after {MAX_RETRIES} attempts; last failure: {last_reason}"
+    )
 
 # ---------- DB helpers ----------
 def ensure_schema(conn: sqlite3.Connection) -> None:
     with open(SCHEMA_PATH, "r", encoding="utf-8") as f:
         conn.executescript(f.read())
+    _ensure_dedup_indexes(conn)
+
+
+# (index name, table, indexed expression list, GROUP BY list for the one-time collapse)
+_DEDUP_INDEXES = (
+    (
+        "idx_attachments_unique",
+        "attachments",
+        "message_id, type, COALESCE(url,''), COALESCE(name,''), COALESCE(data,'')",
+        "message_id, type, COALESCE(url,''), COALESCE(name,''), COALESCE(data,'')",
+    ),
+    (
+        "idx_reactions_unique",
+        "reactions",
+        "message_id, COALESCE(code,''), user_id",
+        "message_id, COALESCE(code,''), user_id",
+    ),
+)
+
+
+def _ensure_dedup_indexes(conn: sqlite3.Connection) -> None:
+    """
+    Give attachments and reactions the uniqueness their INSERT OR IGNORE assumes.
+
+    attachments has only an autoincrement primary key, so OR IGNORE had nothing
+    to conflict against and the head sweep re-inserted a row for every
+    attachment on the newest pages, every cycle. reactions does have a composite
+    primary key, but SQLite treats NULLs as distinct, so rows with a NULL code
+    duplicated the same way.
+
+    Both need a one-time collapse before the index can be created. That scan is
+    the expensive part, so it is skipped once the index exists.
+    """
+    for index_name, table, index_expr, group_expr in _DEDUP_INDEXES:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
+        ).fetchone()
+        if exists:
+            continue
+        conn.execute(f"DELETE FROM {table} WHERE rowid NOT IN "
+                     f"(SELECT MIN(rowid) FROM {table} GROUP BY {group_expr})")
+        conn.execute(f"CREATE UNIQUE INDEX {index_name} ON {table}({index_expr})")
+        conn.commit()
 
 def ensure_member(conn: sqlite3.Connection,
                   user_id: Optional[str],
@@ -164,7 +222,7 @@ def insert_message(conn: sqlite3.Connection, msg: Dict[str, Any]) -> None:
                 (msg["id"], rtype, code, uid)
             )
 
-    # Attachments (idempotent; unique index recommended)
+    # Attachments (idempotent via idx_attachments_unique, see _ensure_dedup_indexes)
     for att in (msg.get("attachments") or []):
         conn.execute(
             "INSERT OR IGNORE INTO attachments(message_id, type, url, lat, lon, name, data) VALUES (?,?,?,?,?,?,?)",
@@ -468,12 +526,20 @@ def main() -> None:
         try:
             while True:
                 loop_start = time.time()
-                added = topoff(conn, verbose=args.verbose, head_pages=args.head_pages)
-                recon_changes = 0
-                if args.reconcile_head > 0:
-                    _, recon_changes = reconcile_head(conn, pages=args.reconcile_head, verbose=args.verbose)
-                if args.verbose:
-                    print(f"[daemon] cycle added={added} reconcile_changes={recon_changes} total={current_total(conn)} at {datetime.now().strftime('%H:%M:%S')}")
+                try:
+                    added = topoff(conn, verbose=args.verbose, head_pages=args.head_pages)
+                    recon_changes = 0
+                    if args.reconcile_head > 0:
+                        _, recon_changes = reconcile_head(conn, pages=args.reconcile_head, verbose=args.verbose)
+                    if args.verbose:
+                        print(f"[daemon] cycle added={added} reconcile_changes={recon_changes} total={current_total(conn)} at {datetime.now().strftime('%H:%M:%S')}")
+                except GroupMeUnavailable as e:
+                    # Keep the cadence rather than exiting: systemd would restart
+                    # us into a full startup sync every RestartSec, which during a
+                    # sustained outage is a restart storm. The next cycle re-reads
+                    # the same head pages, so nothing is skipped.
+                    conn.rollback()
+                    print(f"[daemon] ⚠️  cycle failed, retrying next interval: {e}", flush=True)
                 # sleep remainder
                 elapsed_loop = time.time() - loop_start
                 to_sleep = max(1, args.interval - int(elapsed_loop))
