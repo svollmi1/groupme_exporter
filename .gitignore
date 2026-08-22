@@ -71,3 +71,6 @@ snapshot.err
 fstab
 crontab-root.template
 groupme-daemon.service
+
+# git worktrees used during development
+.worktrees/
